@@ -82,7 +82,7 @@ def log(msg):
 
 def fetch_transactions(wallet):
     url = (
-        f"https://api.bscscan.com/v2/api"
+        f"https://api.etherscan.io/v2/api"
         f"?chainid=56"
         f"&module=account"
         f"&action=tokentx"
