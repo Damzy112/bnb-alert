@@ -1,3 +1,4 @@
+python-dotenv
 requests
 python-telegram-bot
 web3
