@@ -82,8 +82,9 @@ def log(msg):
 
 def fetch_transactions(wallet):
     url = (
-        f"https://api.etherscan.io/v2/api?chainid=56"
-        f"?module=account"
+        f"https://api.bscscan.com/v2/api"
+        f"?chainid=56"
+        f"&module=account"
         f"&action=tokentx"
         f"&address={wallet}"
         f"&sort=desc"
@@ -106,7 +107,6 @@ def fetch_transactions(wallet):
             log(f"⚠️ Unexpected data type from BscScan for {wallet}: {type(data)}")
             return []
 
-        # Ensure 'result' exists and is a list
         result = data.get("result", [])
         if not isinstance(result, list):
             log(f"⚠️ Unexpected result format from BscScan: {result}")
@@ -114,7 +114,7 @@ def fetch_transactions(wallet):
 
         parsed_txs = []
         for tx in result:
-            if tx.get("to", "").lower() == wallet.lower():  # Incoming transaction
+            if tx.get("to", "").lower() == wallet.lower():
                 parsed_txs.append({
                     "hash": tx.get("hash"),
                     "tokenSymbol": tx.get("tokenSymbol"),
@@ -126,6 +126,7 @@ def fetch_transactions(wallet):
     except Exception as e:
         log(f"⚠️ BscScan fetch error: {e}")
         return []
+
 
 def get_token_metadata(token_address):
     """Get token name, symbol, price, and market cap via Dexscreener API"""
