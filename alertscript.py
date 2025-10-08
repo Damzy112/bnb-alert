@@ -13,7 +13,7 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_IDS = os.getenv("TELEGRAM_CHAT_IDS")
-BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY")
+MORALIS_API_KEY = os.getenv("MORALIS_API_KEY")
 
 if TELEGRAM_CHAT_IDS:
     TELEGRAM_CHAT_IDS = [chat_id.strip() for chat_id in TELEGRAM_CHAT_IDS.split(",")]
@@ -21,7 +21,7 @@ if TELEGRAM_CHAT_IDS:
 required_vars = {
     "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
     "TELEGRAM_CHAT_IDS": TELEGRAM_CHAT_IDS,
-    "BSCSCAN_API_KEY": BSCSCAN_API_KEY,
+    "MORALIS_API_KEY": MORALIS_API_KEY,
 }
 missing = [key for key, value in required_vars.items() if not value]
 if missing:
@@ -80,56 +80,46 @@ IGNORED_TOKENS = {
 def log(msg):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
+# === Fetch Transactions via Moralis API ===
 def fetch_transactions(wallet):
-    url = (
-        f"https://api.etherscan.io/v2/api"
-        f"?chainid=56"
-        f"&module=account"
-        f"&action=tokentx"
-        f"&address={wallet}"
-        f"&sort=desc"
-        f"&apikey={BSCSCAN_API_KEY}"
-    )
+    url = f"https://deep-index.moralis.io/api/v2.2/{wallet}/erc20/transfers?chain=bsc"
+    headers = {"accept": "application/json", "X-API-Key": MORALIS_API_KEY}
+
     try:
-        response = requests.get(url)
-        if response.status_code != 200:
-            log(f"[!] Error fetching transfers for {wallet}: {response.status_code} - {response.text}")
+        res = requests.get(url, headers=headers, timeout=15)
+        if res.status_code != 200:
+            log(f"⚠️ Moralis fetch error ({res.status_code}): {res.text}")
             return []
 
-        try:
-            data = response.json()
-        except json.JSONDecodeError:
-            log(f"⚠️ Failed to decode JSON for wallet {wallet}: {response.text}")
-            return []
-
-        # Validate structure
-        if not isinstance(data, dict):
-            log(f"⚠️ Unexpected data type from BscScan for {wallet}: {type(data)}")
-            return []
-
-        result = data.get("result", [])
-        if not isinstance(result, list):
-            log(f"⚠️ Unexpected result format from BscScan: {result}")
+        data = res.json()
+        if not isinstance(data, dict) or "result" not in data:
+            log(f"⚠️ Unexpected response format from Moralis for {wallet}")
             return []
 
         parsed_txs = []
-        for tx in result:
-            if tx.get("to", "").lower() == wallet.lower():
+        for tx in data["result"]:
+            to_addr = tx.get("to_address", "").lower()
+            from_addr = tx.get("from_address", "").lower()
+            contract = tx.get("address", "").lower()
+            tx_hash = tx.get("transaction_hash")
+            symbol = tx.get("token_symbol", "")
+            
+            # Only include incoming transfers to this wallet
+            if to_addr == wallet.lower() and contract not in IGNORED_TOKENS:
                 parsed_txs.append({
-                    "hash": tx.get("hash"),
-                    "tokenSymbol": tx.get("tokenSymbol"),
-                    "contractAddress": tx.get("contractAddress")
+                    "hash": tx_hash,
+                    "tokenSymbol": symbol,
+                    "contractAddress": contract
                 })
 
         return parsed_txs
 
     except Exception as e:
-        log(f"⚠️ BscScan fetch error: {e}")
+        log(f"⚠️ Moralis API error: {e}")
         return []
 
-
+# === Token metadata (Dexscreener) ===
 def get_token_metadata(token_address):
-    """Get token name, symbol, price, and market cap via Dexscreener API"""
     now = time.time()
     if token_address in metadata_cache:
         name, symbol, price, market_cap, timestamp = metadata_cache[token_address]
@@ -155,13 +145,20 @@ def get_token_metadata(token_address):
     metadata_cache[token_address] = (name, symbol, price, market_cap, now)
     return name, symbol, price, market_cap
 
+# === Telegram alert ===
 def send_telegram_alert(message):
     for chat_id in TELEGRAM_CHAT_IDS:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            data={"chat_id": chat_id, "text": message, "parse_mode": "Markdown", "disable_web_page_preview": False}
+            data={
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": False
+            }
         )
 
+# === Telegram blacklist commands ===
 def listen_for_blacklist_commands():
     log("📨 Listening for Telegram blacklist commands...")
     offset = None
@@ -193,8 +190,9 @@ def listen_for_blacklist_commands():
             log(f"⚠️ Telegram listener error: {e}")
         time.sleep(3)
 
+# === Main logic ===
 def main():
-    log("🔁 Starting BNB wallet monitoring...")
+    log("🔁 Starting BNB wallet monitoring (Moralis API)...")
     while True:
         for wallet in WALLETS:
             log(f"🔍 Checking wallet: {wallet}")
@@ -214,6 +212,7 @@ def main():
                 if key not in wallet_buy_times:
                     wallet_buy_times[key] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+                # Trigger alert when 2+ watched wallets have same token
                 if len(token_to_wallets[token_address]) >= 2:
                     name, symbol, price, market_cap = get_token_metadata(token_address)
                     dex_url = f"https://dexscreener.com/bsc/{token_address}"
@@ -255,6 +254,8 @@ def main():
                         f"[🔎 View on Dexscreener]({dex_url}) | [🐦 Search on Twitter]({twitter_url})"
                     )
                     send_telegram_alert(msg)
+
+            time.sleep(2)  # Gentle delay between wallets to save API credits
         time.sleep(15)
 
 if __name__ == "__main__":
