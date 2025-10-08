@@ -81,23 +81,48 @@ def log(msg):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
 def fetch_transactions(wallet):
-    """Fetch latest ERC-20 token transactions using BscScan API"""
-    url = f"https://api.bscscan.com/api?module=account&action=tokentx&address={wallet}&sort=desc&apikey={BSCSCAN_API_KEY}"
+    url = (
+        f"https://api.bscscan.com/api"
+        f"?module=account"
+        f"&action=tokentx"
+        f"&address={wallet}"
+        f"&sort=desc"
+        f"&apikey={BSCSCAN_API_KEY}"
+    )
     try:
         response = requests.get(url)
-        data = response.json()
-        txs = data.get("result", [])
-        transfers = []
-        for tx in txs[:20]:
-            if tx.get("to", "").lower() == wallet.lower():  # incoming tx
-                transfers.append({
+        if response.status_code != 200:
+            log(f"[!] Error fetching transfers for {wallet}: {response.status_code} - {response.text}")
+            return []
+
+        try:
+            data = response.json()
+        except json.JSONDecodeError:
+            log(f"⚠️ Failed to decode JSON for wallet {wallet}: {response.text}")
+            return []
+
+        # Validate structure
+        if not isinstance(data, dict):
+            log(f"⚠️ Unexpected data type from BscScan for {wallet}: {type(data)}")
+            return []
+
+        # Ensure 'result' exists and is a list
+        result = data.get("result", [])
+        if not isinstance(result, list):
+            log(f"⚠️ Unexpected result format from BscScan: {result}")
+            return []
+
+        parsed_txs = []
+        for tx in result:
+            if tx.get("to", "").lower() == wallet.lower():  # Incoming transaction
+                parsed_txs.append({
                     "hash": tx.get("hash"),
                     "tokenSymbol": tx.get("tokenSymbol"),
-                    "contractAddress": tx.get("contractAddress"),
-                    "tokenName": tx.get("tokenName"),
-                    "value": tx.get("value")
+                    "contractAddress": tx.get("contractAddress")
                 })
-        return transfers
+
+        return parsed_txs
+
     except Exception as e:
         log(f"⚠️ BscScan fetch error: {e}")
         return []
