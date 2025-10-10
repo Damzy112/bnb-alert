@@ -1,22 +1,29 @@
 import os
 import time
+import asyncio
 import requests
 import json
 import threading
 import re
 from dotenv import load_dotenv
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime
 import logging
+from fastapi import FastAPI, Request, HTTPException
 
 # ---------------------------
-# Configuration & env load
+# Config & env load
 # ---------------------------
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_IDS = os.getenv("TELEGRAM_CHAT_IDS")
 MORALIS_API_KEY = os.getenv("MORALIS_API_KEY")
+
+# Background config
+MC_CHECK_INTERVAL = int(os.getenv("MC_CHECK_INTERVAL", "600"))  # seconds between market-cap checks (default 10 minutes)
+HONEYPOT_SAMPLE_LIMIT = int(os.getenv("HONEYPOT_SAMPLE_LIMIT", "50"))
+DEXSCREENER_CACHE_TTL = int(os.getenv("DEXSCREENER_CACHE_TTL", "60"))  # seconds
 
 if TELEGRAM_CHAT_IDS:
     TELEGRAM_CHAT_IDS = [chat_id.strip() for chat_id in TELEGRAM_CHAT_IDS.split(",")]
@@ -26,7 +33,7 @@ required_vars = {
     "TELEGRAM_CHAT_IDS": TELEGRAM_CHAT_IDS,
     "MORALIS_API_KEY": MORALIS_API_KEY,
 }
-missing = [key for key, value in required_vars.items() if not value]
+missing = [k for k, v in required_vars.items() if not v]
 if missing:
     raise EnvironmentError(f"Missing required environment variables: {', '.join(missing)}")
 
@@ -42,478 +49,506 @@ logging.basicConfig(
         logging.FileHandler(LOG_FILE)
     ],
 )
-logger = logging.getLogger("bnb_monitor")
+logger = logging.getLogger("bnb_webhook_monitor")
 
 def log(msg):
     logger.info(msg)
 
 # ---------------------------
-# Blacklist system
+# Watchlist & aliases
+# ---------------------------
+WALLETS = {
+    w.lower() for w in [
+        "0x749Ee34445f470d8Bdf1A14a79367408B29d579B",
+        "0xFDE09A5f5DB264bA7261D25E24EB930d67a87b28",
+        "0x65B904285B1c9aB3f6d348446d8c0cEA5b4AeD25",
+        "0x9FcA0F07D2F36B76990DA744C86D4991efEa9C20",
+        "0xA8fCc482f8e04A0D9C4e11f18Fee714f48EdA4b4",
+    ]
+}
+
+WALLET_ALIASES = {
+    "0x749Ee34445f470d8Bdf1A14a79367408B29d579B".lower(): "Alaba",
+    "0xFDE09A5f5DB264bA7261D25E24EB930d67a87b28".lower(): "Benjamin",
+    "0x65B904285B1c9aB3f6d348446d8c0cEA5b4AeD25".lower(): "Caro",
+    "0x9FcA0F07D2F36B76990DA744C86D4991efEa9C20".lower(): "Dolapo",
+    "0xA8fCc482f8e04A0D9C4e11f18Fee714f48EdA4b4".lower(): "Ezekiel"
+}
+
+# ---------------------------
+# Blacklist system (token addresses lowercased)
 # ---------------------------
 BLACKLIST_FILE = "blacklist_bnb.json"
 
 def load_blacklist():
     try:
         with open(BLACKLIST_FILE, "r") as f:
-            return set(json.load(f))
-    except (FileNotFoundError, json.JSONDecodeError):
+            return set([x.lower() for x in json.load(f)])
+    except Exception:
         return set()
 
-def save_blacklist(blacklist):
+def save_blacklist(s):
     with open(BLACKLIST_FILE, "w") as f:
-        json.dump(list(blacklist), f)
+        json.dump(list(s), f)
 
 blacklisted_tokens = load_blacklist()
 
 # ---------------------------
-# Wallets & aliases
+# Globals (in-memory)
 # ---------------------------
-WALLETS = [
-    "0x749Ee34445f470d8Bdf1A14a79367408B29d579B",
-    "0xFDE09A5f5DB264bA7261D25E24EB930d67a87b28",
-    "0x65B904285B1c9aB3f6d348446d8c0cEA5b4AeD25",
-    "0x9FcA0F07D2F36B76990DA744C86D4991efEa9C20",
-    "0xA8fCc482f8e04A0D9C4e11f18Fee714f48EdA4b4",
-]
+seen_transactions = set()            # dedupe tx hashes
+token_to_wallets = defaultdict(set)  # token -> set(watched wallets that bought)
+wallet_buy_times = {}                 # (token,wallet) -> timestamp
+token_tracking = {}                   # token -> {'state','initial_mc','first_time'}
+metadata_cache = {}                   # token -> (name,symbol,price,market_cap,ts)
+honeypot_cache = {}                   # token -> (is_honeypot_bool, checked_at)
+dex_cache = {}                        # token -> (raw_pairs, ts)
 
-WALLET_ALIASES = {
-    "0x749Ee34445f470d8Bdf1A14a79367408B29d579B": "Alaba",
-    "0xFDE09A5f5DB264bA7261D25E24EB930d67a87b28": "Benjamin",
-    "0x65B904285B1c9aB3f6d348446d8c0cEA5b4AeD25": "Caro",
-    "0x9FcA0F07D2F36B76990DA744C86D4991efEa9C20": "Dolapo",
-    "0xA8fCc482f8e04A0D9C4e11f18Fee714f48EdA4b4": "Ezekiel"
-}
-
-# ---------------------------
-# Globals and caches
-# ---------------------------
-seen_transactions = set()
-token_to_wallets = defaultdict(set)
-wallet_buy_times = {}
-initial_market_caps = {}  # token -> (initial_mc_float, first_time_str)
-metadata_cache = {}       # token -> (name, symbol, price, market_cap, timestamp)
-CACHE_TTL = 60  # seconds for metadata cache
-honeypot_cache = {}       # token -> (is_honeypot_bool, checked_at)
-HONEYPOT_TTL = 300        # seconds to cache honeypot result
-
-# token_tracking: state info for alerts and lifecycle
-token_tracking = {}  # token -> {'state': 'tracking'|'stopped'|'alerted', 'initial_mc':float, 'first_time':str}
-
-# Known router addresses for heuristics (PancakeSwap v2 router)
+# Router heuristics (lowercased)
 KNOWN_ROUTER_ADDRESSES = {
-    "0x10ED43C718714eb63d5aA57B78B54704E256024E".lower(),  # PancakeSwap Router v2 (mainnet)
-    # add others if needed
+    "0x10ed43c718714eb63d5aa57b78b54704e256024e",  # PancakeSwap v2
 }
-
-# Ignored tokens (stablecoins / wrappers)
+# Ignored tokens
 IGNORED_TOKENS = {
-    "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c".lower(),  # WBNB
-    "0xe9e7cea3dedca5984780bafc599bd69add087d56".lower(),  # BUSD
-    "0x55d398326f99059ff775485246999027b3197955".lower(),  # USDT
-    "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d".lower()   # USDC
+    "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",
+    "0xe9e7cea3dedca5984780bafc599bd69add087d56",
+    "0x55d398326f99059ff775485246999027b3197955",
+    "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",
 }
+IGNORED_TOKENS = {t.lower() for t in IGNORED_TOKENS}
 
 # ---------------------------
-# Helpers: Telegram
+# FastAPI app
 # ---------------------------
-def send_telegram_alert(message):
+app = FastAPI(title="BNB Moralis Webhook Monitor")
+
+# ---------------------------
+# Telegram helper
+# ---------------------------
+def send_telegram_alert(message: str):
     for chat_id in TELEGRAM_CHAT_IDS:
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            data = {
-                "chat_id": chat_id,
-                "text": message,
-                "parse_mode": "Markdown",
-                "disable_web_page_preview": False
-            }
+            data = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown", "disable_web_page_preview": False}
             r = requests.post(url, data=data, timeout=10)
             if r.status_code != 200:
-                log(f"⚠️ Telegram send failed ({r.status_code}): {r.text}")
+                log(f"⚠️ Telegram send failed ({r.status_code}): {r.text[:200]}")
         except Exception as e:
             log(f"⚠️ Telegram send exception: {e}")
 
 # ---------------------------
-# Moralis: fetch recent ERC20 (BEP20) transfers for a wallet
-# - optimized: limit results, only recent, sequential polling
+# Utility: dex metadata (Dexscreener) - cached
+# returns (name, symbol, price, market_cap)
+# market_cap uses 'fdv' if available
 # ---------------------------
-def fetch_transactions(wallet, limit=20):
-    """
-    Fetch recent token transfers for `wallet` using Moralis v2.2 endpoint.
-    Only returns transfers that are incoming OR outgoing (we'll use both).
-    """
-    url = f"https://deep-index.moralis.io/api/v2.2/{wallet}/erc20/transfers?chain=bsc&limit={limit}"
-    headers = {"accept": "application/json", "X-API-Key": MORALIS_API_KEY}
-
-    try:
-        res = requests.get(url, headers=headers, timeout=15)
-        if res.status_code != 200:
-            log(f"⚠️ Moralis fetch error ({res.status_code}): {res.text[:200]}")
-            return []
-
-        data = res.json()
-        # Moralis returns dict with "result" list. Validate.
-        if not isinstance(data, dict) or "result" not in data or not isinstance(data["result"], list):
-            log(f"⚠️ Unexpected Moralis response format for {wallet}: {str(data)[:200]}")
-            return []
-
-        parsed = []
-        for tx in data["result"]:
-            # Moralis field names (per expected response)
-            tx_hash = tx.get("transaction_hash")
-            token_addr = tx.get("address", "").lower()
-            from_addr = tx.get("from_address", "").lower()
-            to_addr = tx.get("to_address", "").lower()
-            symbol = tx.get("token_symbol", "") or tx.get("symbol", "")
-            # Only consider transfers with contract address
-            if not token_addr:
-                continue
-            parsed.append({
-                "hash": tx_hash,
-                "contractAddress": token_addr,
-                "from": from_addr,
-                "to": to_addr,
-                "symbol": symbol
-            })
-        return parsed
-
-    except Exception as e:
-        log(f"⚠️ Moralis API error for wallet {wallet}: {e}")
-        return []
-
-# ---------------------------
-# Dexscreener metadata (cached)
-# ---------------------------
-def get_token_metadata(token_address):
-    now = time.time()
+def get_token_metadata(token_address: str):
     token_address = token_address.lower()
+    now = time.time()
     if token_address in metadata_cache:
-        name, symbol, price, market_cap, ts = metadata_cache[token_address]
-        if now - ts < CACHE_TTL:
-            return name, symbol, price, market_cap
+        name, symbol, price, mc, ts = metadata_cache[token_address]
+        if now - ts < DEXSCREENER_CACHE_TTL:
+            return name, symbol, price, mc
 
     url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
     try:
         r = requests.get(url, timeout=10)
         if r.status_code != 200:
-            log(f"⚠️ Dexscreener fetch failed ({r.status_code}): {r.text[:200]}")
-            name, symbol, price, market_cap = "Unknown", "", "N/A", "N/A"
+            log(f"⚠️ Dexscreener fetch failed ({r.status_code}) for {token_address}")
+            name, symbol, price, mc = "Unknown", "", "N/A", "N/A"
         else:
-            data = r.json().get("pairs", [])
-            if data:
-                pair = data[0]
-                name = pair.get("baseToken", {}).get("name", "Unknown")
-                symbol = pair.get("baseToken", {}).get("symbol", "")
-                price = pair.get("priceUsd", "N/A")
-                # fdv may be string or number
-                market_cap = pair.get("fdv", "N/A")
+            pairs = r.json().get("pairs", []) or []
+            if pairs:
+                p = pairs[0]
+                name = p.get("baseToken", {}).get("name", "Unknown")
+                symbol = p.get("baseToken", {}).get("symbol", "")
+                price = p.get("priceUsd", "N/A")
+                mc = p.get("fdv", "N/A")
             else:
-                name, symbol, price, market_cap = "Unknown", "", "N/A", "N/A"
+                name, symbol, price, mc = "Unknown", "", "N/A", "N/A"
     except Exception as e:
-        log(f"⚠️ Dexscreener error: {e}")
-        name, symbol, price, market_cap = "Unknown", "", "N/A", "N/A"
+        log(f"⚠️ Dexscreener exception for {token_address}: {e}")
+        name, symbol, price, mc = "Unknown", "", "N/A", "N/A"
 
-    metadata_cache[token_address] = (name, symbol, price, market_cap, now)
-    return name, symbol, price, market_cap
+    metadata_cache[token_address] = (name, symbol, price, mc, now)
+    return name, symbol, price, mc
 
 # ---------------------------
-# Honeypot detection (heuristic)
-# - Checks if token has tradable pair
-# - Checks recent transfers for evidence of sells to pair/router
-# - Cached to avoid repeated Moralis calls
+# Honeypot heuristic (cached)
+# - Check Dexscreener pairs (if none -> suspicious)
+# - Fetch recent contract transfers via Moralis and look for sells to router/pair addresses
 # ---------------------------
-def is_honeypot(token_address, sample_limit=50):
+def is_honeypot(token_address: str, sample_limit: int = HONEYPOT_SAMPLE_LIMIT):
     token_address = token_address.lower()
     now = time.time()
-    # return cached result if fresh
     if token_address in honeypot_cache:
-        result, checked_at = honeypot_cache[token_address]
+        res, checked_at = honeypot_cache[token_address]
         if now - checked_at < HONEYPOT_TTL:
-            return result
+            return res
 
-    log(f"🔎 Running honeypot heuristic for {token_address} ...")
+    log(f"🔎 Honeypot check for {token_address} ...")
 
-    # 1) Check Dexscreener for a pair / liquidity info
+    # 1) Dexscreener pairs
     try:
         r = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=8)
         pairs = r.json().get("pairs", []) if r.status_code == 200 else []
     except Exception as e:
-        log(f"⚠️ Dexscreener error in honeypot check: {e}")
+        log(f"⚠️ Dexscreener error during honeypot check: {e}")
         pairs = []
 
     if not pairs:
-        # no pair => suspicious (potential honeypot)
         honeypot_cache[token_address] = (True, now)
-        log(f"⚠️ Honeypot heuristic: no dex pair found for {token_address}")
+        log(f"⚠️ No pair on Dexscreener => flagged as honeypot: {token_address}")
         return True
 
-    # try to extract pair address(s) if available in feed (not guaranteed)
     pair_addresses = set()
     for pair in pairs:
-        pair_addr = pair.get("pairAddress") or pair.get("pair", {}).get("address")
+        pair_addr = pair.get("pairAddress") or (pair.get("pair") or {}).get("address")
         if pair_addr:
             pair_addresses.add(pair_addr.lower())
 
-    # 2) Look at recent token transfers (search for sells)
-    #    If there are outgoing transfers to router/pair addresses, it's likely sellable (not honeypot)
-    #    If we see NO sells in recent N transfers, mark suspicious
+    # 2) Recent transfers for token (Moralis)
     sells_found = False
     try:
-        # Moralis token transfers (by contract) - fetch recent transfers
         url = f"https://deep-index.moralis.io/api/v2.2/erc20/{token_address}/transfers?chain=bsc&limit={sample_limit}"
         headers = {"accept": "application/json", "X-API-Key": MORALIS_API_KEY}
-        res = requests.get(url, headers=headers, timeout=12)
-        if res.status_code == 200:
-            data = res.json()
+        r = requests.get(url, headers=headers, timeout=12)
+        if r.status_code == 200:
+            data = r.json()
             transfers = data.get("result", []) if isinstance(data, dict) else []
             for t in transfers:
                 to_addr = (t.get("to_address") or "").lower()
-                from_addr = (t.get("from_address") or "").lower()
-                # consider a "sell" when to_addr is a known router or pair
                 if to_addr in KNOWN_ROUTER_ADDRESSES or to_addr in pair_addresses:
                     sells_found = True
                     break
         else:
-            log(f"⚠️ Moralis token transfers fetch failed in honeypot check ({res.status_code})")
+            log(f"⚠️ Moralis token transfers fetch failed ({r.status_code}) during honeypot check")
     except Exception as e:
-        log(f"⚠️ Moralis honeypot check error: {e}")
+        log(f"⚠️ Moralis honeypot fetch exception: {e}")
 
-    # If no sells found, mark honeypot True
     is_hp = not sells_found
     honeypot_cache[token_address] = (is_hp, now)
     if is_hp:
-        log(f"⚠️ Honeypot heuristic flagged {token_address} as possible honeypot (no sells found in recent transfers).")
+        log(f"⚠️ Honeypot heuristic: {token_address} flagged as possible honeypot (no sells found).")
     else:
-        log(f"✅ Honeypot heuristic suggests {token_address} is sellable (sells found).")
+        log(f"✅ Honeypot heuristic: {token_address} appears sellable (sells found).")
     return is_hp
 
 # ---------------------------
-# Utility: stop tracking token
+# Heuristic: is sell tx? (based on tx payload keys we receive)
+# We'll consider to-address in known routers or to pair addresses as sells
 # ---------------------------
-def stop_tracking_token(token_address, reason=""):
-    token_address = token_address.lower()
-    if token_address in token_to_wallets:
-        del token_to_wallets[token_address]
-    # mark state stopped
-    token_tracking[token_address] = {'state': 'stopped'}
-    log(f"⛔ Stopped tracking {token_address}. Reason: {reason}")
-
-# ---------------------------
-# Helper: check for sell tx
-# - Heuristic: if tx.from == wallet and tx.to is router or pair -> treat as sell
-# ---------------------------
-def is_sell_tx(tx):
-    to_addr = (tx.get("to") or "").lower()
-    # if to a known router, treat as sell
+def is_sell_tx_from_payload(tx_dict: dict):
+    to_addr = (tx_dict.get("to") or tx_dict.get("to_address") or tx_dict.get("toAddress") or "").lower()
+    if not to_addr:
+        return False
     if to_addr in KNOWN_ROUTER_ADDRESSES:
         return True
-    # if to a known pair (we don't have full list) - best-effort handled elsewhere
+    # Additional pair heuristics could be added here
     return False
 
 # ---------------------------
-# Main loop
+# Process a single transfer event (bought or sold)
+# Mimics earlier polling logic but triggered by webhook event
 # ---------------------------
-def main():
-    log("🔁 Starting BNB wallet monitoring (Moralis-enhanced)...")
-    # gentle pacing to limit Moralis usage: we will poll each wallet sequentially with short delay
-    while True:
-        for wallet in WALLETS:
-            log(f"🔍 Checking wallet: {wallet}")
-            txs = fetch_transactions(wallet, limit=20)
-            log(f"   ↪ Got {len(txs)} transfers for {wallet}")
+def handle_transfer_event(tx):
+    """
+    Expected tx dict fields (flexible):
+    - transaction_hash / transactionHash / hash
+    - address / token / contractAddress -> token contract
+    - from / from_address / fromAddress
+    - to / to_address / toAddress
+    - token_symbol / tokenSymbol / symbol
+    """
+    # normalize fields
+    tx_hash = tx.get("transaction_hash") or tx.get("transactionHash") or tx.get("hash") or tx.get("tx_hash")
+    token_address = (tx.get("address") or tx.get("token") or tx.get("contractAddress") or "").lower()
+    from_addr = (tx.get("from_address") or tx.get("from") or tx.get("fromAddress") or "").lower()
+    to_addr = (tx.get("to_address") or tx.get("to") or tx.get("toAddress") or "").lower()
+    symbol = tx.get("token_symbol") or tx.get("tokenSymbol") or tx.get("symbol") or ""
 
-            for tx in txs:
-                tx_hash = tx.get("hash")
-                token_address = (tx.get("contractAddress") or "").lower()
-                from_addr = (tx.get("from") or "").lower()
-                to_addr = (tx.get("to") or "").lower()
+    if not tx_hash or not token_address:
+        log(f"   ↪ Skipping payload missing essential fields: {tx_hash}, {token_address}")
+        return
 
-                if not tx_hash or not token_address:
-                    continue
+    if tx_hash in seen_transactions:
+        log(f"   ↪ Duplicate tx {tx_hash} ignored")
+        return
+    seen_transactions.add(tx_hash)
 
-                # skip already seen txs
-                if tx_hash in seen_transactions:
-                    continue
-                seen_transactions.add(tx_hash)
+    # skip ignored/blacklisted tokens
+    if token_address in IGNORED_TOKENS or token_address in blacklisted_tokens:
+        log(f"   ↪ Ignored or blacklisted token {token_address} (tx {tx_hash})")
+        return
 
-                # if token is ignored or blacklisted, skip
-                if token_address in IGNORED_TOKENS or token_address in blacklisted_tokens:
-                    log(f"   ↪ Ignored/blacklisted token {token_address}")
-                    continue
+    # SELL detection (outgoing from watched wallet)
+    if from_addr in WALLETS and is_sell_tx_from_payload(tx):
+        alias = WALLET_ALIASES.get(from_addr, from_addr)
+        name, symbol_m, price, mc = get_token_metadata(token_address)
+        msg = (
+            f"⚠️ *Sell Alert*\n"
+            f"{alias} sold token:\n\n"
+            f"🔹 Token: *{name}* (`{symbol_m or symbol}`)\n"
+            f"💲 Price: `${price}`\n"
+            f"📊 Market Cap: `${mc}`\n"
+            f"🪙 Address: `{token_address}`\n"
+            f"🔁 Tx: `{tx_hash}`\n"
+        )
+        send_telegram_alert(msg)
+        log(f"   ↪ Sent sell alert for {token_address} by {alias}")
+        return
 
-                # If this transaction is an outgoing sell by a watched wallet -> send sell alert
-                if from_addr == wallet.lower() and is_sell_tx(tx):
-                    # send sell alert
-                    alias = WALLET_ALIASES.get(wallet, wallet)
-                    name, symbol, price, market_cap = get_token_metadata(token_address)
-                    msg = (
-                        f"⚠️ *Sell Alert*\n"
-                        f"{alias} sold token:\n\n"
-                        f"🔹 Token: *{name}* (`{symbol}`)\n"
-                        f"💲 Price: `${price}`\n"
-                        f"📊 Market Cap: `${market_cap}`\n"
-                        f"🪙 Address: `{token_address}`\n"
-                        f"🔁 Tx: `{tx_hash}`\n"
-                    )
-                    send_telegram_alert(msg)
-                    log(f"   ↪ Sent sell alert for {token_address} by {alias}")
+    # BUY detection (incoming to watched wallet)
+    if to_addr in WALLETS:
+        watcher = to_addr
+        token_to_wallets[token_address].add(watcher)
+        key = (token_address, watcher)
+        if key not in wallet_buy_times:
+            wallet_buy_times[key] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log(f"   ↪ {WALLET_ALIASES.get(watcher, watcher)} received {token_address} (tx {tx_hash})")
 
-                # If incoming transfer to watched wallet -> treat as buy
-                if to_addr == wallet.lower():
-                    token_to_wallets[token_address].add(wallet)
-                    key = (token_address, wallet)
-                    if key not in wallet_buy_times:
-                        wallet_buy_times[key] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    log(f"   ↪ {WALLET_ALIASES.get(wallet, wallet)} received token {token_address} (tx {tx_hash})")
+        # If >= 2 watched wallets bought -> begin/continue tracking
+        if len(token_to_wallets[token_address]) >= 2:
+            # do not track if previously stopped
+            tk_state = token_tracking.get(token_address, {}).get("state")
+            if tk_state == "stopped":
+                log(f"   ↪ Token {token_address} previously stopped; skipping.")
+                return
 
-                    # When 2+ watched wallets bought same token -> begin tracking if not already
-                    if len(token_to_wallets[token_address]) >= 2:
-                        # If we have already stopped tracking this token, skip
-                        tk_state = token_tracking.get(token_address, {}).get('state')
-                        if tk_state == 'stopped':
-                            log(f"   ↪ Token {token_address} previously stopped; skipping.")
-                            continue
+            # if not yet tracking, set initial MC
+            if token_address not in token_tracking or token_tracking[token_address].get("state") is None:
+                name, symbol_m, price, mc = get_token_metadata(token_address)
+                try:
+                    initial_mc = float(mc)
+                except Exception:
+                    initial_mc = None
 
-                        # If token not yet tracked, set initial market cap
-                        if token_address not in token_tracking or token_tracking[token_address].get('state') is None:
-                            name, symbol, price, market_cap = get_token_metadata(token_address)
-                            try:
-                                initial_mc = float(market_cap)
-                            except Exception:
-                                initial_mc = None
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+                token_tracking[token_address] = {
+                    "state": "tracking",
+                    "initial_mc": initial_mc,
+                    "first_time": now_str
+                }
+                if initial_mc is not None:
+                    log(f"   ↪ Started tracking {token_address} with initial MC {initial_mc} at {now_str}")
+                else:
+                    log(f"   ↪ Started tracking {token_address} with unknown initial MC at {now_str}")
 
-                            now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-                            if initial_mc is not None:
-                                token_tracking[token_address] = {
-                                    'state': 'tracking',
-                                    'initial_mc': initial_mc,
-                                    'first_time': now_str
-                                }
-                                initial_market_caps[token_address] = (initial_mc, now_str)
-                                log(f"   ↪ Started tracking {token_address} with initial MC {initial_mc} at {now_str}")
-                            else:
-                                # If we can't determine market cap, still set tracking but with None
-                                token_tracking[token_address] = {
-                                    'state': 'tracking',
-                                    'initial_mc': None,
-                                    'first_time': now_str
-                                }
-                                log(f"   ↪ Started tracking {token_address} but initial MC unknown.")
+            # now evaluate immediate conditions (honeypot + thresholds)
+            tracking = token_tracking.get(token_address, {})
+            if tracking.get("state") == "tracking":
+                # Honeypot check (conservative)
+                try:
+                    hp = is_honeypot(token_address)
+                except Exception as e:
+                    log(f"   ↪ Honeypot check error for {token_address}: {e}")
+                    hp = True  # be conservative if error
 
-                        # If token is under tracking, evaluate conditions
-                        tracking = token_tracking.get(token_address, {})
-                        if tracking.get('state') == 'tracking':
-                            name, symbol, price, market_cap = get_token_metadata(token_address)
-                            # check honeypot first
-                            try:
-                                hp = is_honeypot(token_address)
-                            except Exception as e:
-                                log(f"   ↪ Honeypot check error for {token_address}: {e}")
-                                hp = True  # be conservative if error
+                if hp:
+                    log(f"   ↪ {token_address} flagged as honeypot — will NOT alert and will stop tracking.")
+                    token_tracking[token_address] = {"state": "stopped"}
+                    return
 
-                            if hp:
-                                log(f"   ↪ {token_address} flagged as honeypot — will NOT alert and will stop tracking.")
-                                # stop tracking and do not alert
-                                stop_tracking_token(token_address, reason="honeypot detected")
-                                continue
+                # immediate market cap check via Dexscreener
+                name, symbol_m, price, mc = get_token_metadata(token_address)
+                try:
+                    current_mc = float(mc)
+                except Exception:
+                    current_mc = None
 
-                            # parse market cap
-                            try:
-                                current_mc = float(market_cap)
-                            except Exception:
-                                current_mc = None
+                initial_mc = tracking.get("initial_mc")
+                if initial_mc is None and current_mc is not None:
+                    token_tracking[token_address]["initial_mc"] = current_mc
+                    token_tracking[token_address]["first_time"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    initial_mc = current_mc
+                    log(f"   ↪ Set initial MC for {token_address} to {initial_mc}")
 
-                            # If initial_mc missing, set it now if possible
-                            if tracking.get('initial_mc') is None and current_mc is not None:
-                                token_tracking[token_address]['initial_mc'] = current_mc
-                                token_tracking[token_address]['first_time'] = datetime.now().strftime("%Y-%m-%d %H:%M")
-                                log(f"   ↪ Set initial MC for {token_address} to {current_mc}")
+                if initial_mc is not None and current_mc is not None:
+                    # stop if dropped <80%
+                    if current_mc < 0.8 * initial_mc:
+                        token_tracking[token_address] = {"state": "stopped"}
+                        log(f"   ↪ Stopped tracking {token_address} because MC dropped below 80% ({current_mc} < 0.8*{initial_mc})")
+                        return
 
-                            initial_mc = token_tracking[token_address].get('initial_mc')
-
-                            # If we have initial_mc and current_mc, check thresholds
-                            if initial_mc and current_mc:
-                                # If market cap dropped below 80% -> stop tracking completely
-                                if current_mc < 0.8 * initial_mc:
-                                    stop_tracking_token(token_address, reason=f"Market cap dropped below 80% ({current_mc} < 0.8*{initial_mc})")
-                                    continue
-
-                                # If market cap increased by +200% (i.e., >= 3x initial) and we haven't alerted yet
-                                if current_mc >= 3.0 * initial_mc and token_tracking[token_address].get('state') == 'tracking':
-                                    # send alert if not honeypot (we already checked)
-                                    wallets_sorted = sorted(
-                                        token_to_wallets[token_address],
-                                        key=lambda w: wallet_buy_times.get((token_address, w), "")
-                                    )
-                                    wallet_list = "\n".join([f"• {WALLET_ALIASES.get(w, w)}" for w in wallets_sorted])
-                                    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-                                    # calculate return %
-                                    pct_return = ((current_mc - initial_mc) / initial_mc) * 100
-                                    msg = (
-                                        f"🚨 *BNB Token BIG MOVE!* 🚀\n"
-                                        f"*{len(token_to_wallets[token_address])} watched wallets* bought this token and market cap is up +200%:\n\n"
-                                        f"🔹 Token: *{name}* (`{symbol}`)\n"
-                                        f"💲 Price: `${price}`\n"
-                                        f"📊 Market Cap: `${market_cap}`\n"
-                                        f"🟩 *Return Since First Alert:* +{pct_return:.2f}%\n"
-                                        f"📅 First Alert: {token_tracking[token_address].get('first_time')}\n"
-                                        f"📅 Now: {now_str}\n"
-                                        f"🪙 Address: `{token_address}`\n\n"
-                                        f"👛 Wallets (by time bought):\n{wallet_list}\n\n"
-                                        f"[🔎 View on Dexscreener](https://dexscreener.com/bsc/{token_address}) | [🐦 Search on Twitter](https://twitter.com/search?q={token_address})"
-                                    )
-                                    send_telegram_alert(msg)
-                                    log(f"   ↪ Sent +200% alert for {token_address}")
-                                    # mark as alerted so we don't spam
-                                    token_tracking[token_address]['state'] = 'alerted'
-                            else:
-                                log(f"   ↪ Unable to evaluate MC thresholds for {token_address} (initial_mc:{initial_mc}, current_mc:{current_mc})")
-                # end incoming buy handling
-            # end for each tx
-
-            # Gentle delay between wallets to avoid hammering Moralis (and conserve units)
-            time.sleep(2)
-
-        # End wallet loop; sleep a bit before next full pass
-        time.sleep(15)
+                    # alert if >= 3x initial
+                    if current_mc >= 3.0 * initial_mc and token_tracking[token_address].get("state") == "tracking":
+                        wallets_sorted = sorted(token_to_wallets[token_address], key=lambda w: wallet_buy_times.get((token_address, w), ""))
+                        wallet_list = "\n".join([f"• {WALLET_ALIASES.get(w, w)}" for w in wallets_sorted])
+                        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+                        pct = ((current_mc - initial_mc) / initial_mc) * 100
+                        msg = (
+                            f"🚨 *BNB Token BIG MOVE!* 🚀\n"
+                            f"*{len(token_to_wallets[token_address])} watched wallets* bought this token and market cap is up +200%:\n\n"
+                            f"🔹 Token: *{name}* (`{symbol_m}`)\n"
+                            f"💲 Price: `${price}`\n"
+                            f"📊 Market Cap: `${mc}`\n"
+                            f"🟩 *Return Since First Alert:* +{pct:.2f}%\n"
+                            f"📅 First Alert: {token_tracking[token_address].get('first_time')}\n"
+                            f"📅 Now: {now_str}\n"
+                            f"🪙 Address: `{token_address}`\n\n"
+                            f"👛 Wallets (by time bought):\n{wallet_list}\n\n"
+                            f"[🔎 View on Dexscreener](https://dexscreener.com/bsc/{token_address}) | [🐦 Search on Twitter](https://twitter.com/search?q={token_address})"
+                        )
+                        send_telegram_alert(msg)
+                        log(f"   ↪ Sent +200% alert for {token_address}")
+                        token_tracking[token_address]["state"] = "alerted"
+                else:
+                    log(f"   ↪ Unable to evaluate MC thresholds for {token_address} (initial:{initial_mc}, current:{current_mc})")
+    # end handle_transfer_event
 
 # ---------------------------
-# Telegram blacklist listener (unchanged, background thread)
+# Extract transfers from Moralis webhook payload
+# Moralis stream payload structure varies; we make this flexible:
+# - Look for lists of objects with token-like keys
+# - Support arrays under top-level keys like 'events', 'result', 'erc20Transfers', etc.
 # ---------------------------
-def listen_for_blacklist_commands():
-    log("📨 Listening for Telegram blacklist commands...")
-    offset = None
+def extract_transfer_objects(payload):
+    transfers = []
+
+    if isinstance(payload, dict):
+        # Common keys
+        for key in ("erc20Transfers", "tokenTransfers", "result", "events", "logs", "transfers"):
+            val = payload.get(key)
+            if isinstance(val, list):
+                transfers.extend(val)
+
+        # Some Moralis payloads include a top-level 'event' object or single transfer
+        # Check the root for transfer-like dict
+        # Heuristic: dicts containing 'transaction_hash' or 'from_address' and 'to_address'
+        for v in payload.values():
+            if isinstance(v, list):
+                for item in v:
+                    if isinstance(item, dict):
+                        if ("transaction_hash" in item) or ("from_address" in item and "to_address" in item):
+                            transfers.append(item)
+            elif isinstance(v, dict):
+                if ("transaction_hash" in v) or ("from_address" in v and "to_address" in v):
+                    transfers.append(v)
+
+    elif isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict):
+                if ("transaction_hash" in item) or ("from_address" in item and "to_address" in item):
+                    transfers.append(item)
+
+    # as a last resort, if payload contains top-level fields resembling a single transfer, append payload itself
+    if not transfers and isinstance(payload, dict):
+        if ("transaction_hash" in payload) or ("from_address" in payload and "to_address" in payload):
+            transfers.append(payload)
+
+    return transfers
+
+# ---------------------------
+# Webhook endpoint for Moralis Stream
+# ---------------------------
+@app.post("/webhook")
+async def webhook(request: Request):
+    """
+    Moralis will POST event payloads here.
+    We accept flexible payload formats and extract transfer objects.
+    """
+    try:
+        payload = await request.json()
+    except Exception as e:
+        log(f"⚠️ Failed to parse JSON payload: {e}")
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    # quick health/log
+    log(f"📥 Received webhook payload: keys={list(payload.keys()) if isinstance(payload, dict) else 'list'}")
+
+    transfers = extract_transfer_objects(payload)
+    if not transfers:
+        log("   ↪ No transfer objects found in payload")
+        return {"status": "ok", "processed": 0}
+
+    processed = 0
+    # process transfers asynchronously but without blocking response
+    for t in transfers:
+        # run handler in background thread to return HTTP 200 quickly to Moralis
+        threading.Thread(target=handle_transfer_event, args=(t,), daemon=True).start()
+        processed += 1
+
+    return {"status": "ok", "processed": processed}
+
+# ---------------------------
+# Background coroutine: periodically check market cap for tracked tokens
+# - Only runs for tokens in token_tracking with state 'tracking'
+# - Uses Dexscreener for market cap (cheap)
+# ---------------------------
+async def periodic_mc_checker():
     while True:
         try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-            params = {"timeout": 30}
-            if offset:
-                params["offset"] = offset
-            res = requests.get(url, params=params, timeout=30)
-            updates = res.json().get("result", [])
-            for update in updates:
-                offset = update["update_id"] + 1
-                msg = update.get("message", {})
-                text = msg.get("text", "").strip()
-                chat_id = str(msg.get("chat", {}).get("id", ""))
+            tracked = [tk for tk, info in token_tracking.items() if info.get("state") == "tracking"]
+            if tracked:
+                log(f"🔁 MC checker: re-evaluating {len(tracked)} tracked tokens")
+            for token in tracked:
+                try:
+                    name, symbol, price, mc = get_token_metadata(token)
+                    try:
+                        current_mc = float(mc)
+                    except Exception:
+                        current_mc = None
+                    initial = token_tracking[token].get("initial_mc")
+                    if initial is None and current_mc is not None:
+                        token_tracking[token]["initial_mc"] = current_mc
+                        token_tracking[token]["first_time"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+                        initial = current_mc
+                        log(f"   ↪ Set initial MC for {token} to {initial} during periodic check")
 
-                if chat_id not in TELEGRAM_CHAT_IDS:
-                    continue
-
-                if re.fullmatch(r"0x[a-fA-F0-9]{40}", text):
-                    if text.lower() in blacklisted_tokens:
-                        send_telegram_alert(f"⚠️ Token already blacklisted:\n`{text}`")
-                    else:
-                        blacklisted_tokens.add(text.lower())
-                        save_blacklist(blacklisted_tokens)
-                        send_telegram_alert(f"✅ Token blacklisted:\n`{text}`")
+                    if initial is not None and current_mc is not None:
+                        # drop below 80%
+                        if current_mc < 0.8 * initial:
+                            token_tracking[token] = {"state": "stopped"}
+                            log(f"   ↪ Stopped tracking {token} because MC dropped below 80% ({current_mc} < 0.8*{initial})")
+                            continue
+                        # alert >= 3x
+                        if current_mc >= 3.0 * initial and token_tracking[token].get("state") == "tracking":
+                            wallets_sorted = sorted(token_to_wallets[token], key=lambda w: wallet_buy_times.get((token, w), ""))
+                            wallet_list = "\n".join([f"• {WALLET_ALIASES.get(w, w)}" for w in wallets_sorted])
+                            now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+                            pct = ((current_mc - initial) / initial) * 100
+                            msg = (
+                                f"🚨 *BNB Token BIG MOVE!* 🚀\n"
+                                f"*{len(token_to_wallets[token])} watched wallets* bought this token and market cap is up +200%:\n\n"
+                                f"🔹 Token: *{name}* (`{symbol}`)\n"
+                                f"💲 Price: `${price}`\n"
+                                f"📊 Market Cap: `${mc}`\n"
+                                f"🟩 *Return Since First Alert:* +{pct:.2f}%\n"
+                                f"📅 First Alert: {token_tracking[token].get('first_time')}\n"
+                                f"📅 Now: {now_str}\n"
+                                f"🪙 Address: `{token}`\n\n"
+                                f"👛 Wallets (by time bought):\n{wallet_list}\n\n"
+                                f"[🔎 View on Dexscreener](https://dexscreener.com/bsc/{token}) | [🐦 Search on Twitter](https://twitter.com/search?q={token})"
+                            )
+                            send_telegram_alert(msg)
+                            log(f"   ↪ Sent +200% periodic alert for {token}")
+                            token_tracking[token]["state"] = "alerted"
+                except Exception as e:
+                    log(f"⚠️ Error during periodic MC check for {token}: {e}")
+            # sleep for configured interval
+            await asyncio.sleep(MC_CHECK_INTERVAL)
         except Exception as e:
-            log(f"⚠️ Telegram listener error: {e}")
-        time.sleep(3)
+            log(f"⚠️ periodic_mc_checker crashed: {e}")
+            await asyncio.sleep(30)
 
 # ---------------------------
-# Entrypoint
+# Startup event: launch periodic checker
+# ---------------------------
+@app.on_event("startup")
+async def startup_event():
+    log("🚀 App starting up - launching background tasks")
+    loop = asyncio.get_event_loop()
+    loop.create_task(periodic_mc_checker())
+
+# ---------------------------
+# Simple health endpoint
+# ---------------------------
+@app.get("/health")
+def health():
+    return {"status": "ok", "tracked_tokens": len(token_tracking), "seen_tx": len(seen_transactions)}
+
+# ---------------------------
+# Run info (if executed directly, uvicorn will be used by Procfile in deployment)
 # ---------------------------
 if __name__ == "__main__":
-    # start listener thread
-    threading.Thread(target=listen_for_blacklist_commands, daemon=True).start()
-    main()
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=False)
