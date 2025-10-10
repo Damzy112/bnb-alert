@@ -1,9 +1,4 @@
-python-dotenv
-requests
-python-telegram-bot
-web3
-redis
 fastapi
 uvicorn
-python-dotenv
 requests
+python-dotenv
