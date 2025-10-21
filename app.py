@@ -236,116 +236,60 @@ def is_sell_tx_from_payload(tx_dict: dict):
 # Handle transfer event
 # ---------------------------
 def handle_transfer_event(tx):
+    """
+    Handles a single ERC20 transfer event from Moralis webhook.
+    Ensures all essential fields exist before processing.
+    """
+
+    tx_hash = tx.get("transactionHash") or tx.get("hash")
+    token_address = tx.get("tokenAddress") or tx.get("address")
+    from_addr = tx.get("fromAddress") or tx.get("from")
+    to_addr = tx.get("toAddress") or tx.get("to")
+    value_raw = tx.get("value") or "0"
+
+    # Handle missing optional metadata
+    token_name = tx.get("tokenName") or "Unknown Token"
+    token_symbol = tx.get("tokenSymbol") or "???"
+    decimals = int(tx.get("decimals") or 18)
+
+    # Validate required fields
+    if not (tx_hash and token_address and from_addr and to_addr):
+        log(f"↪ Skipping payload missing essential fields: {tx_hash}, {token_address}, {from_addr}, {to_addr}")
+        return
+
+    # Convert raw value to readable amount
     try:
-        tx_hash = tx.get("transaction_hash") or tx.get("transactionHash") or tx.get("hash") or tx.get("tx_hash")
-        token_address = (tx.get("address") or tx.get("token") or tx.get("contractAddress") or "").lower()
-        from_addr = (tx.get("from_address") or tx.get("from") or tx.get("fromAddress") or "").lower()
-        to_addr = (tx.get("to_address") or tx.get("to") or tx.get("toAddress") or "").lower()
-        symbol = tx.get("token_symbol") or tx.get("tokenSymbol") or tx.get("symbol") or ""
+        value = int(value_raw) / (10 ** decimals)
+    except Exception:
+        value = 0
 
-        log(f"📥 Processing tx {tx_hash}: token {token_address}, from {from_addr}, to {to_addr}")
+    log(f"📥 Processing tx {tx_hash}: token {token_address}, from {from_addr}, to {to_addr}")
 
-        if not tx_hash or not token_address:
-            log(f"   ↪ Skipping payload missing essential fields: {tx_hash}, {token_address}")
-            return
+    # Identify buyer and check if wallet is being tracked
+    for label, wallet in WALLETS.items():
+        if wallet.lower() == to_addr.lower():
+            log(f"✅ Detected BUY by {label} for {token_name} ({token_symbol})")
 
-        if tx_hash in seen_transactions:
-            log(f"   ↪ Duplicate tx {tx_hash} ignored")
-            return
-        seen_transactions.add(tx_hash)
-
-        # skip ignored/blacklisted tokens
-        if token_address in IGNORED_TOKENS or token_address in blacklisted_tokens:
-            log(f"   ↪ Ignored or blacklisted token {token_address} (tx {tx_hash})")
-            return
-
-        # SELL detection
-        if from_addr in WALLETS and is_sell_tx_from_payload(tx):
-            alias = WALLET_ALIASES.get(from_addr, from_addr)
-            log(f"   ↪ Detected SELL by {alias} for token {token_address}")
-            name, symbol_m, price, mc = get_token_metadata(token_address)
-            msg = (
-                f"⚠️ *Sell Alert*\n"
-                f"{alias} sold token:\n\n"
-                f"🔹 Token: *{name}* (`{symbol_m or symbol}`)\n"
-                f"💲 Price: `${price}`\n"
-                f"📊 Market Cap: `${mc}`\n"
-                f"🪙 Address: `{token_address}`\n"
-                f"🔁 Tx: `{tx_hash}`\n"
+            # Send Telegram alert
+            message = (
+                f"⚠️ *Buy Alert*\n"
+                f"{label} bought token:\n\n"
+                f"🔹 *Token:* {token_name} ({token_symbol})\n"
+                f"🪙 *Contract:* `{token_address}`\n"
+                f"💰 *Amount:* {value}\n"
+                f"🔁 *Tx:* `{tx_hash}`"
             )
-            send_telegram_alert(msg)
-            log(f"   ↪ Sent sell alert for {token_address} by {alias}")
+
+            send_telegram_alert(message)
             return
 
-        # BUY detection
-        if to_addr in WALLETS:
-            watcher = to_addr
-            token_to_wallets[token_address].add(watcher)
-            key = (token_address, watcher)
-            if key not in wallet_buy_times:
-                wallet_buy_times[key] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            log(f"   ↪ Detected BUY by {WALLET_ALIASES.get(watcher, watcher)} for token {token_address}")
+        elif wallet.lower() == from_addr.lower():
+            log(f"ℹ️ {label} sent tokens — not a buy event.")
+            return
 
-            if len(token_to_wallets[token_address]) >= 2:
-                tk_state = token_tracking.get(token_address, {}).get("state")
-                if tk_state == "stopped":
-                    log(f"   ↪ Token {token_address} previously stopped; skipping.")
-                    return
+    # If not in watchlist, still log for visibility
+    log(f"ℹ️ Transaction not from/to watched wallets: {tx_hash}")
 
-                # if not yet tracking, set initial MC
-                if token_address not in token_tracking or token_tracking[token_address].get("state") is None:
-                    name, symbol_m, price, mc = get_token_metadata(token_address)
-                    try:
-                        initial_mc = float(mc)
-                    except Exception:
-                        initial_mc = None
-                    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-                    token_tracking[token_address] = {
-                        "state": "tracking",
-                        "initial_mc": initial_mc,
-                        "first_time": now_str
-                    }
-                    if initial_mc is not None:
-                        log(f"   ↪ Started tracking {token_address} with initial MC {initial_mc} at {now_str}")
-                    else:
-                        log(f"   ↪ Started tracking {token_address} with unknown initial MC at {now_str}")
-
-                # Honeypot check
-                tracking = token_tracking.get(token_address, {})
-                if tracking.get("state") == "tracking":
-                    try:
-                        hp = is_honeypot(token_address)
-                    except Exception as e:
-                        log(f"   ↪ Honeypot check error for {token_address}: {e}")
-                        hp = True
-
-                    if hp:
-                        log(f"   ↪ {token_address} flagged as honeypot — stopping tracking.")
-                        token_tracking[token_address] = {"state": "stopped"}
-                        return
-
-                    # Log current MC evaluation
-                    name, symbol_m, price, mc = get_token_metadata(token_address)
-                    try:
-                        current_mc = float(mc)
-                    except Exception:
-                        current_mc = None
-
-                    initial_mc = tracking.get("initial_mc")
-                    if initial_mc is None and current_mc is not None:
-                        token_tracking[token_address]["initial_mc"] = current_mc
-                        token_tracking[token_address]["first_time"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-                        initial_mc = current_mc
-                        log(f"   ↪ Set initial MC for {token_address} to {initial_mc}")
-
-                    if initial_mc is not None and current_mc is not None:
-                        log(f"   ↪ Tracking token {token_address}, initial MC: {initial_mc}, current MC: {current_mc}")
-                        if current_mc < 0.8 * initial_mc:
-                            token_tracking[token_address] = {"state": "stopped"}
-                            log(f"   ↪ Stopped tracking {token_address} because MC dropped below 80% ({current_mc} < 0.8*{initial_mc})")
-                            return
-    except Exception as e:
-        log(f"⚠️ Exception in handle_transfer_event: {e}")
 
 # ---------------------------
 # Periodic MC checker
