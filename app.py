@@ -422,24 +422,39 @@ def telegram_blacklist_listener():
 # ---------------------------
 @app.post("/webhook")
 async def webhook(req: Request):
+    """
+    Handles incoming Moralis Streams webhook events.
+    Supports ERC20 transfers and raw tx payloads.
+    """
     try:
         data = await req.json()
-    except Exception:
+    except Exception as e:
+        log(f"⚠️ Invalid JSON: {e}")
         raise HTTPException(status_code=400, detail="Invalid JSON")
-    txs = data.get("event") or data.get("events") or data.get("payload")
+
+    # Try all known payload keys from Moralis Streams
+    txs = (
+        data.get("erc20Transfers")  # primary key for ERC20 events
+        or data.get("txs")          # for general tx webhook
+        or data.get("events")       # fallback
+        or data.get("event")
+        or data.get("payload")
+        or data.get("body")
+    )
+
+    # If no events detected, log full payload once for debugging
     if not txs:
-        log("⚠️ Received webhook with no events")
+        snippet = json.dumps(data)[:800]  # limit for Railway logs
+        log(f"⚠️ Received webhook with no events. Raw payload snippet: {snippet}")
         return {"status": "ignored"}
+
+    # Normalise single object to list
     if not isinstance(txs, list):
         txs = [txs]
+
+    # Process all transactions
     for tx in txs:
         handle_transfer_event(tx)
-    return {"status": "ok"}
 
-# ---------------------------
-# Main entry
-# ---------------------------
-if __name__ == "__main__":
-    # Start background tasks
-    threading.Thread(target=telegram_blacklist_listener, daemon=True).start()
-    asyncio.run(periodic_mc_checker())
+    log(f"✅ Processed {len(txs)} transaction(s) from webhook")
+    return {"status": "ok"}
