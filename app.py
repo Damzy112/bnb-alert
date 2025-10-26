@@ -365,40 +365,46 @@ def telegram_blacklist_listener():
 # FastAPI webhook endpoint
 # ---------------------------
 @app.post("/webhook")
-async def webhook(req: Request):
-    """
-    Handles incoming Moralis Streams webhook events.
-    Supports ERC20 transfers and raw tx payloads.
-    """
-    try:
-        data = await req.json()
-    except Exception as e:
-        log(f"⚠️ Invalid JSON: {e}")
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+async def webhook(request: Request):
+    body = await request.json()
+    logging.info("✅ Webhook received")
 
-    # Try all known payload keys from Moralis Streams
-    txs = (
-        data.get("erc20Transfers")  # primary key for ERC20 events
-        or data.get("txs")          # for general tx webhook
-        or data.get("events")       # fallback
-        or data.get("event")
-        or data.get("payload")
-        or data.get("body")
-    )
+    events = []
 
-    # If no events detected, log full payload once for debugging
-    if not txs:
-        snippet = json.dumps(data)[:800]  # limit for Railway logs
-        log(f"⚠️ Received webhook with no events. Raw payload snippet: {snippet}")
-        return {"status": "ignored"}
+    # 1️⃣ Try ERC20 transfers first
+    if "erc20Transfers" in body and body["erc20Transfers"]:
+        events.extend(body["erc20Transfers"])
 
-    # Normalise single object to list
-    if not isinstance(txs, list):
-        txs = [txs]
+    # 2️⃣ Try logs (some chains only send logs)
+    elif "logs" in body and body["logs"]:
+        events.extend(body["logs"])
 
-    # Process all transactions
-    for tx in txs:
-        handle_transfer_event(tx)
+    # 3️⃣ Try transactions (fallback)
+    elif "txs" in body and body["txs"]:
+        events.extend(body["txs"])
 
-    log(f"✅ Processed {len(txs)} transaction(s) from webhook")
-    return {"status": "ok"}
+    if not events:
+        logging.info("⚠️ Received webhook with no events. Raw snippet: %s", json.dumps(body)[:300])
+        return {"status": "no_events"}
+
+    logging.info(f"✅ Processed {len(events)} transaction(s) from webhook")
+
+    for e in events:
+        tx_hash = e.get("transactionHash")
+        from_addr = e.get("fromAddress")
+        to_addr = e.get("toAddress")
+        token_address = e.get("tokenAddress")
+
+        # Skip if key data missing
+        if not tx_hash or not to_addr or not from_addr:
+            logging.info(f"↪ Skipping payload missing essential fields: {tx_hash}, {token_address}, {to_addr}, {from_addr}")
+            continue
+
+        # Log what’s actually inside
+        logging.info(f"🔍 Event data: {json.dumps(e, indent=2)[:500]}")
+
+        # TODO: add your Telegram alert logic here (send_message(...))
+        # Example:
+        # send_telegram_alert(f"New token transfer:\nHash: {tx_hash}\nFrom: {from_addr}\nTo: {to_addr}\nToken: {token_address}")
+
+    return {"status": "processed"}
